@@ -29,7 +29,7 @@ MAX_MAP_SIZE = 6
 MAX_LEVEL = 6 --gray, green, blue, purple, orange, pink
 ATB_GAUGE_SIZE = 100
 VISIBLE_REPORT_LIMIT = 5
-FIGHT_UPDATE_TIMEOUT = 10
+FIGHT_UPDATE_TIMEOUT = 60
 
 --------------------------------------------------Helper functions
 
@@ -38,8 +38,8 @@ FIGHT_UPDATE_TIMEOUT = 10
 function arrayConcat(a, b)	
 	local c = {}
 	
-	for k,v in ipairs(a) do table.insert(c, v) end
-	for k,v in ipairs(b) do table.insert(c, v) end
+	for k,v in ipairs(a) do add(c, v) end
+	for k,v in ipairs(b) do add(c, v) end
 	
 	return c
 end
@@ -112,7 +112,7 @@ function User:replace(replacedUnit, newUnit)
 	self.units[newUnit.id] = newUnit
 end
 
-function User:getInventoryPositions()
+function User:getUnitArray()
 	local unitArray = {}
 	local i = 1
 	for _, unit in pairs(self.units) do
@@ -196,7 +196,7 @@ function Shop:initialize(slots)
 	Shop.inventoryCursorPosition = 1
 	--select slots random keys from AllyDatabase
 	Shop.store = AllyDatabase:selectWithoutReplacement(SHOP_SLOTS)
-	Shop.userInventoryPositions = Player:getInventoryPositions()
+	Shop.userInventoryPositions = Player:getUnitArray()
 	
 end
 
@@ -315,30 +315,47 @@ end
 
 Fight = {}
 
-function Fight:drawNeutral()
+function Fight:drawHP(units, xpos, color)
+	local increment = 7
+	for i,u in ipairs(units) do
+		print(u.name .. ': ' .. u.stats.hp, xpos, 5+i*increment, color)
+	end
 end
 
-function Fight:drawReports()
+function Fight:drawNeutral()
+	self:drawHP(self.allies, 2, 12)
+	self:drawHP(self.enemies, 80, 8)
+end
+
+function Fight:updateVisibleReports()
 	if(Fight.queuedReports == nil) then return end
 	
+	--enqueue new reports
 	for _, v in ipairs(Fight.queuedReports) do
-		table.insert(Fight.visibleReports, v)
+		add(Fight.visibleReports, v)
+		--dequeue old reports
 		if(#Fight.visibleReports > VISIBLE_REPORT_LIMIT) then
-			table.remove(Fight.visibleReports, 1)
+			deli(Fight.visibleReports, 1)
 		end
 	end
 	Fight.queuedReports = nil
+end
+
+function Fight:drawReports()
 	
-	local increment = 3
-	for i, v in ipairs(Fight.queuedReports) do
-		print(v, 2, 60-i*increment, 7)
+	self:updateVisibleReports()
+
+	--draw reports
+	local increment = 7
+	for i, v in ipairs(Fight.visibleReports) do
+		print(v, 2, 80+i*increment, 7)
 	end
+	--assert(1==0, #Fight.visibleReports)
 end
 
 function Fight:makeUnitsFromPrototypes(prototypes)
-	units = {}
-	local i = 0
-	for _,u in pairs(prototypes) do
+	local units = {}
+	for i,u in pairs(prototypes) do
 		units[i] = {}
 		setmetatable(units[i], u)
 		units[i].stats = {}
@@ -346,85 +363,121 @@ function Fight:makeUnitsFromPrototypes(prototypes)
 		units[i].statusEffects = {}
 		units[i].buffs = {}
 		units[i].turnTimer = 0
-
 	end
+	return units
 end
 
-function Fight:handleEffect(unit, effectFunction, sourceName, sourceEvent)
+function Fight:handleEffect(user, target, effectFunction, sourceName, sourceEvent)
 
-	local report = {"[" .. sourceName .. "; " .. sourceEvent .. "] "}
+	local reports = {user.name .. " used " .. sourceName .. " [" .. sourceEvent .. "] "}
 	
 	if(effectFunction == nil) then
-		return report
+		return reports
 	end
 	
-	local effect = effectFunction()
+	local effect = effectFunction(user, target)
 	
-	if(effect.damage != nil) then
-		unit.stats.hp = unit.stats.hp + effect.damage
-		table.push(report, unit.name .. " took " .. effect.damage .. " damage!")
+	if(effect.targetDamage != nil) then
+		target.stats.hp -= effect.targetDamage
+		add(reports, target.name .. " took " .. effect.targetDamage .. " damage!")
 	end
 	
-	return report
+	return reports
+end
+
+function Fight:handleDeath(units)
+	local deadUnitIndices = {}
+	local deathReports = {}
+	
+	for ui,u in ipairs(units) do
+		if(u.stats.hp <= 0) then 
+			add(deadUnitIndices, ui) 
+		end
+	end
+	
+	for _,ui in ipairs(deadUnitIndices) do
+		add(deathReports, units[ui].name .. ' died!')
+		deli(units, ui)
+	end
+	
+	return deathReports
+	
+end
+
+function Fight:checkAndHandleDeath()
+	return arrayConcat(self:handleDeath(self.allies), self:handleDeath(self.enemies))
 end
 
 function Fight:statusTicks(units)
 	local effectReports = {}
-	for ui, u in units do
+	local deadUnits = {}
+	for ui, u in ipairs(units) do
 		--TODO: Keep track of the source of status effects (player, move)
-		for si, s in u.statusEffects do
+		for si, s in ipairs(u.statusEffects) do
 			if(s.duration > 0) then
-				local reports = self:handleEffect(u, s.tick, s.name, "tick")]
+				local reports = self:handleEffect(u, u, s.tick, s.name, "tick")
 				arrayConcat(effectReports, reports)
 				s.duration = s.duration - 1
 			else
-				local reports = self:handleEffect(u, s.expiration, s.name, "expiration")
+				local reports = self:handleEffect(u, u, s.expiration, s.name, "expiration")
 				arrayConcat(effectReports, reports)
-				table.remove(u.statusEffects, si)
+				deli(u.statusEffects, si)
 			end
 		end
 		
-		if(u.stats.hp == 0) then table.remove(units, ui) end
-		
 	end
-	return effectReports
+		
+	return arrayConcat(effectReports, self:checkAndHandleDeath())
 end
 
 function Fight:combatTicks(units)
 	local activeUnits = {}
-	for u in units do
-		units.turnTimer += units.stats.speed
-		if(units.turntimer >= ATB_GAUGE_SIZE) then
-			table.push(activeUnits, u)
-			u.turnTimer = ATB_GAUGE_SIZE - units.turnTimer
+	
+	for _,u in ipairs(units) do
+		u.turnTimer += u.stats.speed
+		--assert(u.turnTimer == -100, u.name .. ' timer is ' .. u.turnTimer .. '(speed=' .. u.stats.speed)
+		if(u.turnTimer >= ATB_GAUGE_SIZE) then
+			add(activeUnits, u)
+			u.turnTimer = ATB_GAUGE_SIZE - u.turnTimer
 		end
 	end
+
 	return activeUnits
 end
 
 function Fight:processAction(activeUnit)
 
+	local reports = {}
+
 	local chosenAction = activeUnit:chooseAction()
-	local chosenTarget = chosenAction:chooseTarget(self.enemies, self.allies)
-	local effect = chosenAction.effect
+	local targetingFunction = TargetingFunctions:get(chosenAction.targeting)
+	local chosenTarget = 0
+	if(activeUnit.isEnemy) then
+		chosenTarget = targetingFunction(self.allies, self.enemies)
+	else
+		chosenTarget = targetingFunction(self.enemies, self.allies)
+	end
+	local effect = StatusEffectDatabase:get(chosenAction.effect)
 	
-	table.push(chosenTarget.statusEffects, effect)
-	local report = self:handleEffect(chosenTarget, effect.application, effect.name, "application")	
-	
-	return chosenAction, report
+	add(chosenTarget.statusEffects, effect)
+	reports = arrayConcat(reports, self:handleEffect(activeUnit, chosenTarget, effect.application, effect.name, "application"))	
+		
+	return chosenAction, arrayConcat(reports, self:checkAndHandleDeath())
 
 end
 
 function Fight:initialize()
 	--TODO build a smarter way to select enemies based on map level
-	self.enemies = self:makeUnitsFromPrototypes(EnemyDatabase:selectWithoutReplacement(3))
+	self.enemies = self:makeUnitsFromPrototypes(EnemyDatabase:selectWithoutReplacement(1))
+	self.allies = self:makeUnitsFromPrototypes(Player:getUnitArray())
 	
-	self.allies = self:makeUnitsFromPrototypes(User.units)
+
 	self.activeUnitQueue = {}
 	self.animationActive = false
 	self.totalCombatTicks = 0
 	self.visibleReports = {}
 	self.activeAnimation = nil
+	self.stateTimeout = FIGHT_UPDATE_TIMEOUT
 	
 end
 
@@ -440,24 +493,34 @@ function Fight:updateState()
 	if(self.stateTimeout > 0) then return end
 	
 	--advance combat until we queue a unit
+	local allyEffectReports = {}
+	local enemyEffectReports = {}
+	local newAllyReports = {}
+	local newEnemyReports = {}
+		
 	while(#self.activeUnitQueue == 0) do
 		if(#self.allies == 0) then return State.GAME_OVER end
 		if(#self.enemies == 0) then return State.VICTORY end
 		
-		local allyEffectReports = self:statusTicks(self.allies)
-		local enemyEffectReports = self:statusTicks(self.enemies)
+		newAllyReports = self:statusTicks(self.allies)
+		newEnemyReports = self:statusTicks(self.enemies)
+		if(#newAllyReports > 0) then 
+			allyEffectReports = arrayConcat(allyEffectReports, newAllyReports)
+		end
+		if(#newEnemyReports > 0) then 
+			enemyEffectReports = arrayConcat(enemyEffectReports, newEnemyReports)
+		end
 		
 		--TODO: randomize this output
 		self.activeUnitQueue = arrayConcat(self:combatTicks(self.allies), self:combatTicks(self.enemies))
 		self.totalCombatTicks = self.totalCombatTicks + 1
 	end
 	
-	local chosenAction, local actionReport = self:processAction(self.activeUnitQueue[#self.activeUnitQueue])
+	local chosenAction, actionReports = self:processAction(deli(self.activeUnitQueue))
 	self.activeAnimation = {}
-	setmetatable(self.activeAnimation, chosenAction.animation)
-	table.remove(self.activeUnitQueue)
+	setmetatable(self.activeAnimation, AnimationDatabase:get(chosenAction.animation))
 	
-	Fight.queuedReports = arrayConcat(arrayConcat(allyEffectReports, enemyEffectReports), actionReport)
+	Fight.queuedReports = arrayConcat(arrayConcat(allyEffectReports, enemyEffectReports), actionReports)
 	
 	--Lock state again
 	self.stateTimeout = FIGHT_UPDATE_TIMEOUT
@@ -491,6 +554,7 @@ function GameOverScreen:updateState()
 end
 
 function GameOverScreen:draw()
+	print("game over bitch", 30, 30, 3)
 end
 
 Intermission = {}
@@ -582,10 +646,7 @@ function _init()
 	Map:create()
 	Map.tail = Map.first:growStageTree(6, DIFFICULTY_INCREMENT)
 	
-	StatusEffectDatabase:initialize()
-	ActionDatabase:initialize()
-	AllyDatabase:initialize()
-	EnemyDatabase:initialize()
+	DBInit()
 		
 	Shop:initialize()
 	CurrentState = State.SHOP
@@ -651,7 +712,12 @@ end
 
 --TODO: make this smarter for each unit type
 function Unit:chooseAction()
-	return self.actions[1+flr(rnd(#self.actions))]
+	return ActionDatabase:get(self.actions[1+flr(rnd(#self.actions))])
+end
+
+function Unit:indexTableFields()
+	self.stats.__index = self.stats
+	self.actions.__index = self.actions
 end
 
 Database = {}
@@ -659,7 +725,7 @@ Database.__index = Database
 Database.elements = {}
 
 function Database:get(ind)
-	return Database.elements[ind]
+	return self.elements[ind]
 end
 
 function Database:getKeyset()
@@ -679,10 +745,13 @@ function Database:setElementMeta(metaClass)
 	for _, element in pairs(self.elements) do
 		element.__index = element
 		setmetatable(element, metaClass)
+		
+		if(metaClass == Unit) then
+			element:indexTableFields()
+		end
 	end
 end
 
---TODO is there a bug?
 function Database:selectWithoutReplacement(n)
 	local keyset = self:getKeyset()
 	assert(n <= #keyset, 'requested ' .. tostring(n) .. ' elements from set of ' .. tostring(#keyset))
@@ -694,8 +763,8 @@ function Database:selectWithoutReplacement(n)
 		local elementIndex = 1+flr(rnd(upperBound))
 		
 		chosenElements[i] = {}
+		chosenElements[i].__index = chosenElements[i]
 		setmetatable(chosenElements[i], self.elements[keyset[elementIndex]])
-		
 		local holder = keyset[upperBound]
 		keyset[upperBound] = keyset[elementIndex]
 		keyset[elementIndex] = holder
@@ -712,7 +781,7 @@ function AllyDatabase:initialize()
 		WAR={
 			id = 'WAR',
 			name = 'Warrior',
-			actions = {ActionDatabase['Attack']},
+			actions = {'Attack'},
 			stats =  {
 				hp = 400,
 				power = 4,
@@ -724,7 +793,7 @@ function AllyDatabase:initialize()
 		CLR={
 			id = 'CLR',
 			name = 'Cleric',
-			actions = {ActionDatabase['Attack']},--{ActionDatabase['Cure']},
+			actions = {'Attack'},--{ActionDatabase['Cure']},
 			stats =  {
 				hp = 400,
 				power = 4,
@@ -736,7 +805,7 @@ function AllyDatabase:initialize()
 		WLK={
 			id = 'WLK',
 			name = 'Warlock',
-			actions = {ActionDatabase['Attack']},
+			actions = {'Attack'},
 			stats =  {
 				hp = 400,
 				power = 4,
@@ -748,7 +817,7 @@ function AllyDatabase:initialize()
 		KGT={
 			id = 'KGT',
 			name = 'Knight',
-			actions = {ActionDatabase['Attack']},
+			actions = {'Attack'},
 			stats =  {
 				hp = 400,
 				power = 4,
@@ -760,7 +829,7 @@ function AllyDatabase:initialize()
 		ROG={
 			id = 'ROG',
 			name = 'Rogue',
-			actions = {ActionDatabase['Attack']},
+			actions = {'Attack'},
 			stats =  {
 				hp = 400,
 				power = 4,
@@ -771,6 +840,7 @@ function AllyDatabase:initialize()
 	}
 	
 	self:setElementMeta(Unit)
+	
 end
 
 EnemyDatabase = {}
@@ -781,7 +851,8 @@ function EnemyDatabase:initialize()
 		Goblin = {
 			id = 'Goblin',
 			name = 'Goblin',
-			actions = {ActionDatabase['Attack']},
+			isEnemy = true,
+			actions = {'Attack'},
 			stats =  {
 				hp = 100,
 				power = 2,
@@ -818,7 +889,7 @@ function AnimationDatabase:initialize()
 			draw = function () return nil end,
 		},
 	}
-	self.setElementMeta(Animation)
+	self:setElementMeta(Animation)
 end
 
 -----------------------------------------------------------------
@@ -853,7 +924,7 @@ function StatusEffectDatabase:initialize()
 		AttackDamage = {
 			name = 'AttackDamage',
 			duration=0,
-			application=function (user, target) return {damage=user.power*10} end,
+			application=function (user, target) return {targetDamage=user.stats.power*10} end,
 			tick=nil,
 			check=nil,
 			expiration=nil
@@ -862,7 +933,7 @@ function StatusEffectDatabase:initialize()
 		SingleTargetHeal = {
 			name = 'SingleTargetHeal',
 			duration=0,
-			application=function (user, target) return {damage=-user.power*15} end,
+			application=function (user, target) return {targetDamage=-user.stats.power*15} end,
 			tick=nil,
 			check=nil,
 			expiration=nil
@@ -884,20 +955,29 @@ function ActionDatabase:initialize()
 	
 		Attack = {
 			name = 'Attack',
-			chooseTarget=TargetingFunctions['AnyEnemy'],
-			effect=StatusEffectDatabase['AttackDamage'],
-			animation=AnimationDatabase['Attack']
+			targeting='AnyEnemy',
+			effect='AttackDamage',
+			animation='Attack'
 		},
 		
 		Cure = {
 			name = 'Cure',
-			chooseTarget=TargetingFunctions['AnyAlly'],
-			effect=StatusEffectDatabase['SingleTargetHeal'],
-			animation=AnimationDatabase['Cure']
+			targeting='AnyAlly',
+			effect='SingleTargetHeal',
+			animation='Cure'
 		},
 	}
 	
 	self:setElementMeta(Action)
+end
+
+function DBInit()
+	TargetingFunctions:initialize()
+	AnimationDatabase:initialize()
+	StatusEffectDatabase:initialize()
+	ActionDatabase:initialize()
+	AllyDatabase:initialize()
+	EnemyDatabase:initialize()
 end
 
 __gfx__
